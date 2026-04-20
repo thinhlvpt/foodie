@@ -1,0 +1,22 @@
+@import "tailwindcss";
+
+.bg-pattern {
+  background-color: #f8fafc;
+  background-image: radial-gradient(#e2e8f0 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+/* Tùy chỉnh thanh cuộn ngang cho danh mục */
+.scrollbar-thin::-webkit-scrollbar {
+  height: 4px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background-color: #e2e8f0;
+  border-radius: 10px;
+}
+.scrollbar-thin:hover::-webkit-scrollbar-thumb {
+  background-color: #cbd5e1;
+}
