@@ -7,6 +7,7 @@ import {
 
 // === CẤU HÌNH API QUAN TRỌNG ===
 const SCRIPT_URL = import.meta.env.VITE_SCRIPT_URL || '';
+const VISIT_GUARD_KEY = '__thodia_visit_sent__';
 
 // === CẤU HÌNH TÊN WEB ===
 const APP_NAME = import.meta.env.VITE_APP_NAME || 'Foodie Local';
@@ -20,6 +21,113 @@ const CATEGORIES = [
   { id: 'quan-nhau', label: 'Quán nhậu / Bar', keywords: ['nhậu', 'nhau', 'bar', 'pub'], icon: <Beer className="w-4 h-4" /> },
   { id: 'checkin', label: 'Địa điểm Check-in', keywords: ['check-in', 'checkin', 'check in', 'địa điểm'], icon: <Camera className="w-4 h-4" /> },
 ];
+
+const SPONSOR_TIER_WEIGHTS = {
+  0: 1,
+  1: 2,
+  2: 4,
+  3: 8,
+  4: 20,
+};
+
+const TIME_FIELD_ALIASES = {
+  sang: ['sang'],
+  trua: ['trua'],
+  chieu: ['chieu'],
+  toi: ['toi'],
+  khuya: ['khuya', 'rangsang', 'khuyarangsang'],
+};
+
+const TIME_SLOTS = ['khuya', 'sang', 'trua', 'chieu', 'toi'];
+
+function removeAccents(str) {
+  return str ? str.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase() : '';
+}
+
+function normalizeKey(str) {
+  return removeAccents(str || '').replace(/[^a-z0-9]/g, '');
+}
+
+function splitCategoryValues(value) {
+  if (!value) return [];
+  return String(value)
+    .split(/[|,;/]+/)
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
+function parseSponsorTier(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+  return Math.max(0, Math.round(numeric));
+}
+
+function parseBoostScore(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 1;
+  return numeric;
+}
+
+function getTierWeight(tier) {
+  const normalizedTier = parseSponsorTier(tier);
+  if (SPONSOR_TIER_WEIGHTS[normalizedTier]) return SPONSOR_TIER_WEIGHTS[normalizedTier];
+  return SPONSOR_TIER_WEIGHTS[4] + (normalizedTier - 4) * 4;
+}
+
+function getMerchantWeight(item) {
+  const tierWeight = getTierWeight(item.sponsor_tier);
+  const boostScore = parseBoostScore(item.boost_score);
+  return Math.max(0.0001, tierWeight * boostScore);
+}
+
+function hashToUnitInterval(value) {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  const positiveHash = hash >>> 0;
+  return (positiveHash + 1) / 4294967297;
+}
+
+function doesCategoryValueMatch(categoryValue, categoryDef) {
+  if (!categoryValue || !categoryDef) return false;
+  const categoryLower = String(categoryValue).toLowerCase();
+  const categoryNoAccent = removeAccents(categoryValue);
+  return categoryDef.keywords.some(keyword =>
+    categoryLower.includes(keyword) || categoryNoAccent.includes(removeAccents(keyword))
+  );
+}
+
+function getItemCategoryValues(item) {
+  if (Array.isArray(item.__categoryValues) && item.__categoryValues.length > 0) {
+    return item.__categoryValues;
+  }
+  return splitCategoryValues(item.phan_loai);
+}
+
+function isTruthyTimeValue(value) {
+  if (value === true || value === 1) return true;
+  if (typeof value === 'string') {
+    const normalizedValue = removeAccents(value).trim();
+    return ['true', '1', 'yes', 'y', 'x', 'co'].includes(normalizedValue);
+  }
+  return false;
+}
+
+function isOpenInSingleRow(row, slot) {
+  const aliases = TIME_FIELD_ALIASES[slot] || [slot];
+
+  return Object.entries(row).some(([key, value]) => {
+    const normalized = normalizeKey(key);
+    return aliases.includes(normalized) && isTruthyTimeValue(value);
+  });
+}
+
+function isOpenInTimeSlot(item, slot) {
+  const rows = Array.isArray(item.__rows) && item.__rows.length > 0 ? item.__rows : [item];
+  return rows.some(row => isOpenInSingleRow(row, slot));
+}
 
 export default function App() {
   const [data, setData] = useState([]);
@@ -38,6 +146,7 @@ export default function App() {
     currentStatus: 'sang', currentLabel: 'Sáng', nextStatus: 'trua', nextLabel: 'Trưa'
   });
   const [activeFilter, setActiveFilter] = useState('current');
+  const [shuffleSeed, setShuffleSeed] = useState(() => Date.now());
 
   // Lazy loading state
   const [visibleCount, setVisibleCount] = useState(10);
@@ -49,14 +158,16 @@ export default function App() {
       const currentHour = new Date().getHours();
       let currentStatus = '', currentLabel = '', nextStatus = '', nextLabel = '';
 
-      if (currentHour >= 5 && currentHour < 11) {
+      if (currentHour >= 0 && currentHour < 5) {
+        currentStatus = 'khuya'; currentLabel = 'Khuya'; nextStatus = 'sang'; nextLabel = 'Sáng';
+      } else if (currentHour >= 5 && currentHour < 11) {
         currentStatus = 'sang'; currentLabel = 'Sáng'; nextStatus = 'trua'; nextLabel = 'Trưa';
       } else if (currentHour >= 11 && currentHour < 14) {
         currentStatus = 'trua'; currentLabel = 'Trưa'; nextStatus = 'chieu'; nextLabel = 'Chiều';
       } else if (currentHour >= 14 && currentHour < 18) {
         currentStatus = 'chieu'; currentLabel = 'Chiều'; nextStatus = 'toi'; nextLabel = 'Tối';
       } else {
-        currentStatus = 'toi'; currentLabel = 'Tối'; nextStatus = 'sang'; nextLabel = 'Sáng mai';
+        currentStatus = 'toi'; currentLabel = 'Tối'; nextStatus = 'khuya'; nextLabel = 'Khuya';
       }
       setTimeConfig({ currentStatus, currentLabel, nextStatus, nextLabel });
     };
@@ -68,13 +179,57 @@ export default function App() {
 
   // 2. Fetch Data có Cache
   useEffect(() => {
+    const parseViewCount = (payload) => {
+      if (!payload || typeof payload !== 'object') return null;
+      const rawCount = payload.viewCount ?? payload.view_count ?? payload.views ?? payload.totalViews;
+      const numericCount = Number(rawCount);
+      return Number.isFinite(numericCount) ? numericCount : null;
+    };
+
+    const buildScriptUrl = (action) => {
+      const url = new URL(SCRIPT_URL);
+      if (action) url.searchParams.set('action', action);
+      return url.toString();
+    };
+
+    const shouldTrackVisit = () => {
+      if (typeof window === 'undefined') return false;
+      if (window[VISIT_GUARD_KEY]) return false;
+      window[VISIT_GUARD_KEY] = true;
+      return true;
+    };
+
+    const incrementVisitCount = async () => {
+      if (!SCRIPT_URL.startsWith('http') || !shouldTrackVisit()) return null;
+      try {
+        const response = await fetch(buildScriptUrl('visit'));
+        const result = await response.json();
+        const count = parseViewCount(result);
+        if (count !== null) {
+          setViewCount(count);
+          sessionStorage.setItem('thodia_view_count', String(count));
+        }
+        return count;
+      } catch (err) {
+        console.error('Visit tracking error:', err);
+        return null;
+      }
+    };
+
     const fetchData = async () => {
       const cachedData = sessionStorage.getItem('thodia_data');
+      const cachedViewCount = sessionStorage.getItem('thodia_view_count');
       if (cachedData) {
         setData(JSON.parse(cachedData));
         setLoading(false);
       } else {
         setLoading(true);
+      }
+      if (cachedViewCount) {
+        const parsedCachedCount = Number(cachedViewCount);
+        if (Number.isFinite(parsedCachedCount)) {
+          setViewCount(parsedCachedCount);
+        }
       }
 
       setError(null);
@@ -85,6 +240,12 @@ export default function App() {
         if (result.status === 'success') {
           setData(result.data);
           sessionStorage.setItem('thodia_data', JSON.stringify(result.data));
+
+          const countFromData = parseViewCount(result);
+          if (countFromData !== null) {
+            setViewCount(countFromData);
+            sessionStorage.setItem('thodia_view_count', String(countFromData));
+          }
         } else {
           if (!cachedData) throw new Error(result.message || 'Lỗi không xác định từ Google Sheets');
         }
@@ -93,29 +254,21 @@ export default function App() {
         console.error('Fetch error:', err);
       } finally {
         setLoading(false);
-        setViewCount(Math.floor(Math.random() * 500) + 2500);
+        await incrementVisitCount();
       }
     };
     fetchData();
   }, []);
 
-  // Reset lazy load khi có thay đổi bộ lọc
-  useEffect(() => {
-    setVisibleCount(10);
-  }, [searchQuery, activeCategories, selectedAreas, activeFilter]);
-
   // Lấy danh sách khu vực
-  const allUniqueAreas = useMemo(() => [...new Set(data.map(item => item.khu_vuc).filter(Boolean))], [data]);
-  const filteredModalAreas = useMemo(() =>
-    allUniqueAreas.filter(area => area?.toLowerCase().includes(modalSearchQuery.toLowerCase())),
-    [allUniqueAreas, modalSearchQuery]
-  );
-
   const toggleArea = (area) => {
+    setVisibleCount(10);
     setSelectedAreas(prev => prev.includes(area) ? prev.filter(a => a !== area) : [...prev, area]);
   };
 
   const toggleCategory = (categoryId) => {
+    setVisibleCount(10);
+    setShuffleSeed(prev => prev + 1);
     if (categoryId === 'all') {
       setActiveCategories([]);
     } else {
@@ -136,39 +289,158 @@ export default function App() {
   };
 
   // Hàm loại bỏ dấu tiếng Việt để tìm kiếm
-  const removeAccents = (str) => {
-    return str ? str.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase() : '';
+  const hasSearchQuery = searchQuery.trim() !== '';
+
+  const getDisplayCategory = (item) => {
+    const categories = getItemCategoryValues(item);
+    if (categories.length === 0) return item.phan_loai || 'Khac';
+    if (activeCategories.length === 0) return categories[0];
+
+    const matchedCategory = categories.find(categoryValue =>
+      activeCategories.some(catId => {
+        const categoryDef = CATEGORIES.find(category => category.id === catId);
+        return doesCategoryValueMatch(categoryValue, categoryDef);
+      })
+    );
+
+    return matchedCategory || categories[0];
+  };
+
+  const getAvailabilityMeta = (item) => {
+    const selectedTimeField = activeFilter === 'current' ? timeConfig.currentStatus : timeConfig.nextStatus;
+    const isInSelectedTimeWindow = isOpenInTimeSlot(item, selectedTimeField);
+
+    if (isInSelectedTimeWindow) {
+      return { isInSelectedTimeWindow: true, statusLabel: '' };
+    }
+
+    if (activeFilter === 'next') {
+      return { isInSelectedTimeWindow: false, statusLabel: 'Chưa tới giờ mở' };
+    }
+
+    const currentSlotIndex = TIME_SLOTS.indexOf(timeConfig.currentStatus);
+    const openSlotIndexes = TIME_SLOTS
+      .filter(slot => isOpenInTimeSlot(item, slot))
+      .map(slot => TIME_SLOTS.indexOf(slot));
+
+    if (openSlotIndexes.length === 0) {
+      return { isInSelectedTimeWindow: false, statusLabel: 'Đã đóng cửa' };
+    }
+
+    const hasUpcomingSlotToday = openSlotIndexes.some(index => index > currentSlotIndex);
+
+    return {
+      isInSelectedTimeWindow: false,
+      statusLabel: hasUpcomingSlotToday ? 'Chưa tới giờ mở' : 'Đã đóng cửa',
+    };
   };
 
   // 3. Lọc dữ liệu
-  const filteredData = useMemo(() => {
-    return data.filter(item => {
-      // Tìm kiếm theo tên
-      const matchesSearch = searchQuery === '' || removeAccents(item.ten_quan).includes(removeAccents(searchQuery));
+  const groupedData = useMemo(() => {
+    const merchantMap = new Map();
 
-      // Lọc theo danh mục (hỗ trợ nhiều danh mục và tìm theo từ khóa)
-      let matchesCategory = true;
-      if (activeCategories.length > 0 && item.phan_loai) {
-        matchesCategory = activeCategories.some(catId => {
-          const categoryDef = CATEGORIES.find(c => c.id === catId);
-          if (!categoryDef) return false;
-          const itemType = item.phan_loai.toLowerCase();
-          const itemTypeNoAccent = removeAccents(item.phan_loai);
-          // Kiểm tra xem phân loại của quán có chứa bất kỳ keyword nào của danh mục không
-          return categoryDef.keywords.some(k => itemType.includes(k) || itemTypeNoAccent.includes(removeAccents(k)));
+    data.forEach((row, index) => {
+      const merchantId = String(row.merchant_id ?? row.quan_id ?? '').trim();
+      const fallbackName = normalizeKey(row.ten_quan || row.ten || '');
+      const fallbackArea = normalizeKey(row.khu_vuc || '');
+      const fallbackLink = normalizeKey(row.link || '');
+      const fallbackKeyRaw = [fallbackName, fallbackArea, fallbackLink].filter(Boolean).join('__');
+      const merchantKey = merchantId ? `id:${merchantId}` : `fallback:${fallbackKeyRaw || `row_${index}`}`;
+
+      if (!merchantMap.has(merchantKey)) {
+        merchantMap.set(merchantKey, {
+          key: merchantKey,
+          representative: row,
+          rows: [],
+          categories: new Set(),
+          areas: new Set(),
+          sponsorTier: 0,
+          boostScore: 1,
         });
       }
 
-      const matchesArea = selectedAreas.length === 0 || selectedAreas.includes(item.khu_vuc);
+      const merchant = merchantMap.get(merchantKey);
+      merchant.rows.push(row);
 
-      const timeField = activeFilter === 'current' ? timeConfig.currentStatus : timeConfig.nextStatus;
-      const matchesTime = item[timeField] === true;
+      splitCategoryValues(row.phan_loai).forEach(value => merchant.categories.add(value));
+      if (row.khu_vuc) merchant.areas.add(row.khu_vuc);
 
-      return matchesSearch && matchesCategory && matchesArea && matchesTime;
-    }).sort((a, b) => new Date(b.ngay_them) - new Date(a.ngay_them));
-  }, [data, searchQuery, activeCategories, selectedAreas, activeFilter, timeConfig]);
+      merchant.sponsorTier = Math.max(
+        merchant.sponsorTier,
+        parseSponsorTier(row.sponsor_tier ?? row.ad_tier ?? row.paid_tier)
+      );
+      merchant.boostScore = Math.max(
+        merchant.boostScore,
+        parseBoostScore(row.boost_score ?? row.display_rate ?? row.weight_score)
+      );
+    });
 
-  // Lấy dữ liệu hiển thị theo lazy loading
+    return Array.from(merchantMap.values()).map(merchant => ({
+      ...merchant.representative,
+      __merchantKey: merchant.key,
+      __rows: merchant.rows,
+      __categoryValues: merchant.categories.size > 0
+        ? Array.from(merchant.categories)
+        : splitCategoryValues(merchant.representative.phan_loai),
+      __areas: merchant.areas.size > 0
+        ? Array.from(merchant.areas)
+        : [merchant.representative.khu_vuc].filter(Boolean),
+      sponsor_tier: merchant.sponsorTier,
+      boost_score: merchant.boostScore,
+    }));
+  }, [data]);
+
+  const allUniqueAreas = useMemo(() => {
+    const allAreas = groupedData.flatMap(item => item.__areas || []);
+    return [...new Set(allAreas.filter(Boolean))];
+  }, [groupedData]);
+
+  const filteredModalAreas = useMemo(() =>
+    allUniqueAreas.filter(area => area?.toLowerCase().includes(modalSearchQuery.toLowerCase())),
+    [allUniqueAreas, modalSearchQuery]
+  );
+
+  // 3. Loc du lieu
+  const filteredData = useMemo(() => {
+    const timeField = activeFilter === 'current' ? timeConfig.currentStatus : timeConfig.nextStatus;
+
+    const filtered = groupedData.filter(item => {
+      const matchesSearch = searchQuery === '' || removeAccents(item.ten_quan).includes(removeAccents(searchQuery));
+
+      let matchesCategory = true;
+      if (activeCategories.length > 0) {
+        const itemCategories = getItemCategoryValues(item);
+        matchesCategory = activeCategories.some(catId => {
+          const categoryDef = CATEGORIES.find(c => c.id === catId);
+          if (!categoryDef) return false;
+          return itemCategories.some(categoryValue => doesCategoryValueMatch(categoryValue, categoryDef));
+        });
+      }
+
+      const itemAreas = Array.isArray(item.__areas) ? item.__areas : [item.khu_vuc].filter(Boolean);
+      const matchesArea = selectedAreas.length === 0 || itemAreas.some(area => selectedAreas.includes(area));
+      const matchesTime = isOpenInTimeSlot(item, timeField);
+
+      return matchesSearch && matchesCategory && matchesArea && (hasSearchQuery || matchesTime);
+    });
+
+    return [...filtered].sort((a, b) => {
+      const aKey = `${shuffleSeed}|${a.__merchantKey || normalizeKey(a.ten_quan || '')}`;
+      const bKey = `${shuffleSeed}|${b.__merchantKey || normalizeKey(b.ten_quan || '')}`;
+
+      const aRandom = Math.max(hashToUnitInterval(aKey), Number.EPSILON);
+      const bRandom = Math.max(hashToUnitInterval(bKey), Number.EPSILON);
+      const aWeight = getMerchantWeight(a);
+      const bWeight = getMerchantWeight(b);
+
+      const aPriorityKey = -Math.log(aRandom) / aWeight;
+      const bPriorityKey = -Math.log(bRandom) / bWeight;
+
+      return aPriorityKey - bPriorityKey;
+    });
+  }, [groupedData, searchQuery, activeCategories, selectedAreas, activeFilter, timeConfig, hasSearchQuery, shuffleSeed]);
+
+  // Lay du lieu hien thi theo lazy loading
   const visibleData = useMemo(() => filteredData.slice(0, visibleCount), [filteredData, visibleCount]);
 
   // 4. Observer cho Lazy Loading
@@ -221,14 +493,21 @@ export default function App() {
                 placeholder="Tìm tên quán..."
                 className="w-full pl-9 pr-3 py-2 bg-slate-100 border-none rounded-xl focus:ring-2 focus:ring-indigo-500 focus:bg-white transition-all outline-none text-slate-700 text-sm font-medium"
                 value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                onChange={(e) => {
+                  setVisibleCount(10);
+                  setSearchQuery(e.target.value);
+                }}
               />
             </div>
 
             {/* Thu gọn bộ lọc thời gian */}
             <div className="flex bg-slate-100 rounded-xl p-1 shrink-0">
               <button
-                onClick={() => setActiveFilter('current')}
+                onClick={() => {
+                  setVisibleCount(10);
+                  setActiveFilter('current');
+                  setShuffleSeed(prev => prev + 1);
+                }}
                 className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold transition-all ${activeFilter === 'current' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500'
                   }`}
               >
@@ -236,7 +515,11 @@ export default function App() {
                 Mở ({timeConfig.currentLabel})
               </button>
               <button
-                onClick={() => setActiveFilter('next')}
+                onClick={() => {
+                  setVisibleCount(10);
+                  setActiveFilter('next');
+                  setShuffleSeed(prev => prev + 1);
+                }}
                 className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold transition-all ${activeFilter === 'next' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500'
                   }`}
               >
@@ -282,7 +565,10 @@ export default function App() {
                 <X className="w-3 h-3" />
               </button>
             ))}
-            <button onClick={() => setSelectedAreas([])} className="text-[11px] font-bold text-slate-400 hover:text-red-500 px-2 py-1">Xóa tất cả</button>
+            <button onClick={() => {
+              setVisibleCount(10);
+              setSelectedAreas([]);
+            }} className="text-[11px] font-bold text-slate-400 hover:text-red-500 px-2 py-1">Xóa tất cả</button>
           </div>
         )}
 
@@ -302,43 +588,54 @@ export default function App() {
           </div>
         ) : filteredData.length > 0 ? (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {visibleData.map((item, index) => (
+            {visibleData.map((item, index) => {
+              const availability = getAvailabilityMeta(item);
+              const isDimmedBySearch = hasSearchQuery && !availability.isInSelectedTimeWindow;
+
+              return (
               <div
-                key={index}
-                className="group bg-white rounded-2xl p-4 border border-slate-200/60 shadow-sm hover:shadow-lg hover:shadow-indigo-500/5 hover:-translate-y-0.5 transition-all duration-300 flex flex-col h-full"
+                key={item.__merchantKey || `${item.ten_quan}-${index}`}
+                className={`group bg-white rounded-2xl p-4 border border-slate-200/60 shadow-sm hover:shadow-lg hover:shadow-indigo-500/5 hover:-translate-y-0.5 transition-all duration-300 flex flex-col h-full ${isDimmedBySearch ? 'bg-slate-50 border-slate-300/70' : ''}`}
               >
                 <div className="flex items-center gap-2 mb-2">
                   <span className="px-2 py-1 bg-indigo-50 text-indigo-600 rounded text-[9px] font-extrabold uppercase tracking-wider border border-indigo-100">
-                    {item.phan_loai}
+                    {getDisplayCategory(item)}
                   </span>
+                  {isDimmedBySearch && (
+                    <span className="px-2 py-1 bg-amber-100 text-amber-800 rounded text-[9px] font-extrabold uppercase tracking-wider border border-amber-300 shadow-sm">
+                      {availability.statusLabel}
+                    </span>
+                  )}
                 </div>
 
-                <h2 className="text-lg font-extrabold text-slate-800 leading-tight mb-3 group-hover:text-indigo-600 transition-colors line-clamp-2">
-                  {item.ten_quan}
-                </h2>
+                <div className={isDimmedBySearch ? 'opacity-55' : ''}>
+                  <h2 className="text-lg font-extrabold text-slate-800 leading-tight mb-3 group-hover:text-indigo-600 transition-colors line-clamp-2">
+                    {item.ten_quan}
+                  </h2>
 
-                <div className="flex-1 flex flex-col justify-end gap-2 mb-4">
-                  <div className="flex items-center text-slate-500 text-[13px] font-medium">
-                    <MapPin className="w-3.5 h-3.5 mr-2 text-indigo-400 shrink-0" />
-                    <span className="line-clamp-1">{item.khu_vuc}</span>
+                  <div className="flex-1 flex flex-col justify-end gap-2 mb-4">
+                    <div className="flex items-center text-slate-500 text-[13px] font-medium">
+                      <MapPin className="w-3.5 h-3.5 mr-2 text-indigo-400 shrink-0" />
+                      <span className="line-clamp-1">{item.khu_vuc}</span>
+                    </div>
+                    <div className="flex items-center text-slate-400 text-[10px] font-bold uppercase tracking-wide">
+                      <Calendar className="w-3.5 h-3.5 mr-2 text-slate-300 shrink-0" />
+                      Cập nhật {getRelativeTime(item.ngay_them)}
+                    </div>
                   </div>
-                  <div className="flex items-center text-slate-400 text-[10px] font-bold uppercase tracking-wide">
-                    <Calendar className="w-3.5 h-3.5 mr-2 text-slate-300 shrink-0" />
-                    Cập nhật {getRelativeTime(item.ngay_them)}
-                  </div>
+
+                  <a
+                    href={item.link}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full px-4 py-2.5 bg-slate-900 hover:bg-indigo-600 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition-all duration-300 shadow-sm active:scale-95 mt-auto"
+                  >
+                    Chi tiết
+                    <ChevronRight className="w-4 h-4" />
+                  </a>
                 </div>
-
-                <a
-                  href={item.link}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="w-full px-4 py-2.5 bg-slate-900 hover:bg-indigo-600 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition-all duration-300 shadow-sm active:scale-95 mt-auto"
-                >
-                  Chi tiết
-                  <ChevronRight className="w-4 h-4" />
-                </a>
               </div>
-            ))}
+            )})}
 
             {/* Lazy load observer target */}
             {visibleCount < filteredData.length && (
@@ -378,7 +675,10 @@ export default function App() {
               <h3 className="text-lg font-extrabold text-slate-900">Chọn khu vực</h3>
               <div className="flex items-center gap-2">
                 {selectedAreas.length > 0 && (
-                  <button onClick={() => setSelectedAreas([])} className="text-sm font-bold text-red-500 hover:text-red-600 px-3 py-1.5">
+                  <button onClick={() => {
+                    setVisibleCount(10);
+                    setSelectedAreas([]);
+                  }} className="text-sm font-bold text-red-500 hover:text-red-600 px-3 py-1.5">
                     Xóa chọn
                   </button>
                 )}
@@ -449,3 +749,6 @@ export default function App() {
     </div>
   );
 }
+
+
+

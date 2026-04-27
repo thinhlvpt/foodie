@@ -47,3 +47,10 @@ Chào mừng bạn đến với dự án **Thổ Địa Local**! Đây là một
 ## 📄 Giấy phép
 
 Dự án này được phát triển bởi **Antigravity AI** cho mục đích cộng đồng. Bạn có thể tự do sử dụng và chỉnh sửa.
+
+## GAS Mới (Dedup + Commercial Rank)
+
+- Script mới nằm tại: [gas/Code.gs](/d:/Project Handmade/WebAmThuc/web-app/gas/Code.gs)
+- Hướng dẫn triển khai: [gas/README.md](/d:/Project Handmade/WebAmThuc/web-app/gas/README.md)
+- Cột mới cần thêm trong sheet:
+`merchant_id`, `sponsor_tier`, `boost_score`
