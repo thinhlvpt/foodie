@@ -42,6 +42,7 @@ const TIME_SLOTS = ['khuya', 'sang', 'trua', 'chieu', 'toi'];
 
 // --- GEOLOCATION & DISTANCE HELPERS ---
 const OSRM_API_BASE = 'https://router.project-osrm.org/table/v1/driving/';
+const NULL_ISLAND_EPSILON = 0.0001;
 
 function calculateHaversine(lat1, lon1, lat2, lon2) {
   const R = 6371; // Bán kính Trái Đất (km)
@@ -58,17 +59,37 @@ function calculateHaversine(lat1, lon1, lat2, lon2) {
 function extractCoords(item) {
   if (!item) return null;
 
+  const parseNumericCoord = (raw) => {
+    if (raw === null || raw === undefined || raw === '') return null;
+    if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
+    const normalized = String(raw).trim().replace(',', '.');
+    const numeric = Number(normalized);
+    return Number.isFinite(numeric) ? numeric : null;
+  };
+
+  const isValidLatLng = (lat, lng) =>
+    Number.isFinite(lat) &&
+    Number.isFinite(lng) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lng >= -180 &&
+    lng <= 180;
+
   const parsePair = (latRaw, lngRaw) => {
-    const lat = Number(latRaw);
-    const lng = Number(lngRaw);
-    if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng };
+    const lat = parseNumericCoord(latRaw);
+    const lng = parseNumericCoord(lngRaw);
+    if (lat === null || lng === null) return null;
+    if (isValidLatLng(lat, lng)) return { lat, lng };
+
+    // Một số data source bị đảo cặp lat/lng.
+    if (isValidLatLng(lng, lat)) return { lat: lng, lng: lat };
     return null;
   };
 
   const direct = parsePair(item.lat, item.lng);
   if (direct) return direct;
 
-  const combined = item.toa_do || item.coordinates || item.gps || item.lat_lng;
+  const combined = item.toa_do || item.toa_o || item.coordinates || item.gps || item.lat_lng;
   if (combined && String(combined).includes(',')) {
     const parts = String(combined).split(',');
     if (parts.length >= 2) {
@@ -78,6 +99,14 @@ function extractCoords(item) {
   }
 
   return null;
+}
+
+function isNullIslandCoords(coords) {
+  if (!coords) return false;
+  return (
+    Math.abs(coords.lat) <= NULL_ISLAND_EPSILON &&
+    Math.abs(coords.lng) <= NULL_ISLAND_EPSILON
+  );
 }
 
 function removeAccents(str) {
@@ -207,10 +236,18 @@ export default function App() {
     setLocationStatus('prompting');
     navigator.geolocation.getCurrentPosition(
       (position) => {
-        setUserCoords({
+        const nextCoords = {
           lat: position.coords.latitude,
           lng: position.coords.longitude
-        });
+        };
+
+        if (isNullIslandCoords(nextCoords)) {
+          setLocationStatus('denied');
+          setShowLocationAlert(true);
+          return;
+        }
+
+        setUserCoords(nextCoords);
         setLocationStatus('granted');
         setShowLocationAlert(false);
       },
@@ -938,5 +975,4 @@ export default function App() {
     </div>
   );
 }
-
 
