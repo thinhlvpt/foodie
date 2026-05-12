@@ -22,6 +22,136 @@ const CATEGORIES = [
   { id: 'checkin', label: 'Địa điểm Check-in', keywords: ['check-in', 'checkin', 'check in', 'địa điểm'], icon: <Camera className="w-4 h-4" /> },
 ];
 
+const SPONSOR_TIER_WEIGHTS = {
+  0: 1,
+  1: 2,
+  2: 4,
+  3: 8,
+  4: 20,
+};
+
+const TIME_FIELD_ALIASES = {
+  sang: ['sang'],
+  trua: ['trua'],
+  chieu: ['chieu'],
+  toi: ['toi'],
+  khuya: ['khuya', 'rangsang', 'khuyarangsang'],
+};
+
+const TIME_SLOTS = ['khuya', 'sang', 'trua', 'chieu', 'toi'];
+
+// --- GEOLOCATION & DISTANCE HELPERS ---
+const OSRM_API_BASE = 'https://router.project-osrm.org/table/v1/driving/';
+
+function calculateHaversine(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Bán kính Trái Đất (km)
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = 
+    Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+    Math.sin(dLon/2) * Math.sin(dLon/2); 
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); 
+  return R * c;
+}
+
+function extractCoords(item) {
+  if (!item || !item.lat || !item.lng) return null;
+  const lat = Number(item.lat);
+  const lng = Number(item.lng);
+  if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng };
+  return null;
+}
+
+function removeAccents(str) {
+  return str ? str.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase() : '';
+}
+
+function normalizeKey(str) {
+  return removeAccents(str || '').replace(/[^a-z0-9]/g, '');
+}
+
+function splitCategoryValues(value) {
+  if (!value) return [];
+  return String(value)
+    .split(/[|,;/]+/)
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
+function parseSponsorTier(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+  return Math.max(0, Math.round(numeric));
+}
+
+function parseBoostScore(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 1;
+  return numeric;
+}
+
+function getTierWeight(tier) {
+  const normalizedTier = parseSponsorTier(tier);
+  if (SPONSOR_TIER_WEIGHTS[normalizedTier]) return SPONSOR_TIER_WEIGHTS[normalizedTier];
+  return SPONSOR_TIER_WEIGHTS[4] + (normalizedTier - 4) * 4;
+}
+
+function getMerchantWeight(item) {
+  const tierWeight = getTierWeight(item.sponsor_tier);
+  const boostScore = parseBoostScore(item.boost_score);
+  return Math.max(0.0001, tierWeight * boostScore);
+}
+
+function hashToUnitInterval(value) {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  const positiveHash = hash >>> 0;
+  return (positiveHash + 1) / 4294967297;
+}
+
+function doesCategoryValueMatch(categoryValue, categoryDef) {
+  if (!categoryValue || !categoryDef) return false;
+  const categoryLower = String(categoryValue).toLowerCase();
+  const categoryNoAccent = removeAccents(categoryValue);
+  return categoryDef.keywords.some(keyword =>
+    categoryLower.includes(keyword) || categoryNoAccent.includes(removeAccents(keyword))
+  );
+}
+
+function getItemCategoryValues(item) {
+  if (Array.isArray(item.__categoryValues) && item.__categoryValues.length > 0) {
+    return item.__categoryValues;
+  }
+  return splitCategoryValues(item.phan_loai);
+}
+
+function isTruthyTimeValue(value) {
+  if (value === true || value === 1) return true;
+  if (typeof value === 'string') {
+    const normalizedValue = removeAccents(value).trim();
+    return ['true', '1', 'yes', 'y', 'x', 'co'].includes(normalizedValue);
+  }
+  return false;
+}
+
+function isOpenInSingleRow(row, slot) {
+  const aliases = TIME_FIELD_ALIASES[slot] || [slot];
+
+  return Object.entries(row).some(([key, value]) => {
+    const normalized = normalizeKey(key);
+    return aliases.includes(normalized) && isTruthyTimeValue(value);
+  });
+}
+
+function isOpenInTimeSlot(item, slot) {
+  const rows = Array.isArray(item.__rows) && item.__rows.length > 0 ? item.__rows : [item];
+  return rows.some(row => isOpenInSingleRow(row, slot));
+}
+
 export default function App() {
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -44,6 +174,37 @@ export default function App() {
   // Lazy loading state
   const [visibleCount, setVisibleCount] = useState(10);
   const observerTarget = useRef(null);
+
+  // State cho Định vị & Khoảng cách
+  const [userCoords, setUserCoords] = useState(null);
+  const [locationStatus, setLocationStatus] = useState('idle'); // idle, prompting, granted, denied
+  const [showLocationAlert, setShowLocationAlert] = useState(false);
+  const [roadDistances, setRoadDistances] = useState({}); // { merchantKey: string }
+
+  const requestLocation = () => {
+    if (!navigator.geolocation) {
+      alert("Trình duyệt của bạn không hỗ trợ định vị GPS.");
+      return;
+    }
+    
+    setLocationStatus('prompting');
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        setUserCoords({
+          lat: position.coords.latitude,
+          lng: position.coords.longitude
+        });
+        setLocationStatus('granted');
+        setShowLocationAlert(false);
+      },
+      (err) => {
+        console.error("GPS Error:", err);
+        setLocationStatus('denied');
+        setShowLocationAlert(true);
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  };
 
   // 1. Logic thời gian
   useEffect(() => {
@@ -153,23 +314,14 @@ export default function App() {
     fetchData();
   }, []);
 
-  // Reset lazy load khi có thay đổi bộ lọc
-  useEffect(() => {
-    setVisibleCount(10);
-  }, [searchQuery, activeCategories, selectedAreas, activeFilter]);
-
   // Lấy danh sách khu vực
-  const allUniqueAreas = useMemo(() => [...new Set(data.map(item => item.khu_vuc).filter(Boolean))], [data]);
-  const filteredModalAreas = useMemo(() =>
-    allUniqueAreas.filter(area => area?.toLowerCase().includes(modalSearchQuery.toLowerCase())),
-    [allUniqueAreas, modalSearchQuery]
-  );
-
   const toggleArea = (area) => {
+    setVisibleCount(10);
     setSelectedAreas(prev => prev.includes(area) ? prev.filter(a => a !== area) : [...prev, area]);
   };
 
   const toggleCategory = (categoryId) => {
+    setVisibleCount(10);
     setShuffleSeed(prev => prev + 1);
     if (categoryId === 'all') {
       setActiveCategories([]);
@@ -177,29 +329,6 @@ export default function App() {
       setActiveCategories(prev => prev.includes(categoryId) ? prev.filter(id => id !== categoryId) : [...prev, categoryId]);
     }
   };
-
-  // Xao tron on dinh theo seed de khong doi thu tu moi lan re-render
-  const shuffleArrayWithSeed = (items, seed) => {
-    const shuffled = [...items];
-    let randomSeed = seed;
-
-    const seededRandom = () => {
-      randomSeed |= 0;
-      randomSeed = (randomSeed + 0x6D2B79F5) | 0;
-      let t = Math.imul(randomSeed ^ (randomSeed >>> 15), 1 | randomSeed);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-
-    for (let i = shuffled.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(seededRandom() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-
-    return shuffled;
-  };
-
-  const shuffledData = useMemo(() => shuffleArrayWithSeed(data, shuffleSeed), [data, shuffleSeed]);
 
   const getRelativeTime = (dateString) => {
     if (!dateString) return "Chưa cập nhật";
@@ -214,38 +343,21 @@ export default function App() {
   };
 
   // Hàm loại bỏ dấu tiếng Việt để tìm kiếm
-  const removeAccents = (str) => {
-    return str ? str.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase() : '';
-  };
   const hasSearchQuery = searchQuery.trim() !== '';
 
-  const normalizeKey = (str) => removeAccents(str || '').replace(/[^a-z0-9]/g, '');
+  const getDisplayCategory = (item) => {
+    const categories = getItemCategoryValues(item);
+    if (categories.length === 0) return item.phan_loai || 'Khac';
+    if (activeCategories.length === 0) return categories[0];
 
-  const isTruthyTimeValue = (value) => {
-    if (value === true || value === 1) return true;
-    if (typeof value === 'string') {
-      const normalizedValue = removeAccents(value).trim();
-      return ['true', '1', 'yes', 'y', 'x', 'co'].includes(normalizedValue);
-    }
-    return false;
-  };
+    const matchedCategory = categories.find(categoryValue =>
+      activeCategories.some(catId => {
+        const categoryDef = CATEGORIES.find(category => category.id === catId);
+        return doesCategoryValueMatch(categoryValue, categoryDef);
+      })
+    );
 
-  const TIME_FIELD_ALIASES = {
-    sang: ['sang'],
-    trua: ['trua'],
-    chieu: ['chieu'],
-    toi: ['toi'],
-    khuya: ['khuya', 'rangsang', 'khuyarangsang'],
-  };
-  const TIME_SLOTS = ['khuya', 'sang', 'trua', 'chieu', 'toi'];
-
-  const isOpenInTimeSlot = (item, slot) => {
-    const aliases = TIME_FIELD_ALIASES[slot] || [slot];
-
-    return Object.entries(item).some(([key, value]) => {
-      const normalized = normalizeKey(key);
-      return aliases.includes(normalized) && isTruthyTimeValue(value);
-    });
+    return matchedCategory || categories[0];
   };
 
   const getAvailabilityMeta = (item) => {
@@ -278,34 +390,111 @@ export default function App() {
   };
 
   // 3. Lọc dữ liệu
-  const filteredData = useMemo(() => {
-    return shuffledData.filter(item => {
-      // Tìm kiếm theo tên
-      const matchesSearch = searchQuery === '' || removeAccents(item.ten_quan).includes(removeAccents(searchQuery));
+  const groupedData = useMemo(() => {
+    const merchantMap = new Map();
 
-      // Lọc theo danh mục (hỗ trợ nhiều danh mục và tìm theo từ khóa)
-      let matchesCategory = true;
-      if (activeCategories.length > 0 && item.phan_loai) {
-        matchesCategory = activeCategories.some(catId => {
-          const categoryDef = CATEGORIES.find(c => c.id === catId);
-          if (!categoryDef) return false;
-          const itemType = item.phan_loai.toLowerCase();
-          const itemTypeNoAccent = removeAccents(item.phan_loai);
-          // Kiểm tra xem phân loại của quán có chứa bất kỳ keyword nào của danh mục không
-          return categoryDef.keywords.some(k => itemType.includes(k) || itemTypeNoAccent.includes(removeAccents(k)));
+    data.forEach((row, index) => {
+      const merchantId = String(row.merchant_id ?? row.quan_id ?? '').trim();
+      const fallbackName = normalizeKey(row.ten_quan || row.ten || '');
+      const fallbackArea = normalizeKey(row.khu_vuc || '');
+      const fallbackLink = normalizeKey(row.link || '');
+      const fallbackKeyRaw = [fallbackName, fallbackArea, fallbackLink].filter(Boolean).join('__');
+      const merchantKey = merchantId ? `id:${merchantId}` : `fallback:${fallbackKeyRaw || `row_${index}`}`;
+
+      if (!merchantMap.has(merchantKey)) {
+        merchantMap.set(merchantKey, {
+          key: merchantKey,
+          representative: row,
+          rows: [],
+          categories: new Set(),
+          areas: new Set(),
+          sponsorTier: 0,
+          boostScore: 1,
         });
       }
 
-      const matchesArea = selectedAreas.length === 0 || selectedAreas.includes(item.khu_vuc);
+      const merchant = merchantMap.get(merchantKey);
+      merchant.rows.push(row);
 
-      const timeField = activeFilter === 'current' ? timeConfig.currentStatus : timeConfig.nextStatus;
+      splitCategoryValues(row.phan_loai).forEach(value => merchant.categories.add(value));
+      if (row.khu_vuc) merchant.areas.add(row.khu_vuc);
+
+      merchant.sponsorTier = Math.max(
+        merchant.sponsorTier,
+        parseSponsorTier(row.sponsor_tier ?? row.ad_tier ?? row.paid_tier)
+      );
+      merchant.boostScore = Math.max(
+        merchant.boostScore,
+        parseBoostScore(row.boost_score ?? row.display_rate ?? row.weight_score)
+      );
+    });
+
+    return Array.from(merchantMap.values()).map(merchant => ({
+      ...merchant.representative,
+      __merchantKey: merchant.key,
+      __rows: merchant.rows,
+      __categoryValues: merchant.categories.size > 0
+        ? Array.from(merchant.categories)
+        : splitCategoryValues(merchant.representative.phan_loai),
+      __areas: merchant.areas.size > 0
+        ? Array.from(merchant.areas)
+        : [merchant.representative.khu_vuc].filter(Boolean),
+      sponsor_tier: merchant.sponsorTier,
+      boost_score: merchant.boostScore,
+    }));
+  }, [data]);
+
+  const allUniqueAreas = useMemo(() => {
+    const allAreas = groupedData.flatMap(item => item.__areas || []);
+    return [...new Set(allAreas.filter(Boolean))];
+  }, [groupedData]);
+
+  const filteredModalAreas = useMemo(() =>
+    allUniqueAreas.filter(area => area?.toLowerCase().includes(modalSearchQuery.toLowerCase())),
+    [allUniqueAreas, modalSearchQuery]
+  );
+
+  // 3. Loc du lieu
+  const filteredData = useMemo(() => {
+    const timeField = activeFilter === 'current' ? timeConfig.currentStatus : timeConfig.nextStatus;
+
+    const filtered = groupedData.filter(item => {
+      const matchesSearch = searchQuery === '' || removeAccents(item.ten_quan).includes(removeAccents(searchQuery));
+
+      let matchesCategory = true;
+      if (activeCategories.length > 0) {
+        const itemCategories = getItemCategoryValues(item);
+        matchesCategory = activeCategories.some(catId => {
+          const categoryDef = CATEGORIES.find(c => c.id === catId);
+          if (!categoryDef) return false;
+          return itemCategories.some(categoryValue => doesCategoryValueMatch(categoryValue, categoryDef));
+        });
+      }
+
+      const itemAreas = Array.isArray(item.__areas) ? item.__areas : [item.khu_vuc].filter(Boolean);
+      const matchesArea = selectedAreas.length === 0 || itemAreas.some(area => selectedAreas.includes(area));
       const matchesTime = isOpenInTimeSlot(item, timeField);
 
       return matchesSearch && matchesCategory && matchesArea && (hasSearchQuery || matchesTime);
     });
-  }, [shuffledData, searchQuery, activeCategories, selectedAreas, activeFilter, timeConfig, hasSearchQuery]);
 
-  // Lấy dữ liệu hiển thị theo lazy loading
+    return [...filtered].sort((a, b) => {
+      const aKey = `${shuffleSeed}|${a.__merchantKey || normalizeKey(a.ten_quan || '')}`;
+      const bKey = `${shuffleSeed}|${b.__merchantKey || normalizeKey(b.ten_quan || '')}`;
+
+      const aRandom = Math.max(hashToUnitInterval(aKey), Number.EPSILON);
+      const bRandom = Math.max(hashToUnitInterval(bKey), Number.EPSILON);
+      const aWeight = getMerchantWeight(a);
+      const bWeight = getMerchantWeight(b);
+
+      const aPriorityKey = -Math.log(aRandom) / aWeight;
+      const bPriorityKey = -Math.log(bRandom) / bWeight;
+
+      return aPriorityKey - bPriorityKey;
+    });
+  }, [groupedData, searchQuery, activeCategories, selectedAreas, activeFilter, timeConfig, hasSearchQuery, shuffleSeed]);
+
+  // Lay du lieu hien thi theo lazy loading
   const visibleData = useMemo(() => filteredData.slice(0, visibleCount), [filteredData, visibleCount]);
 
   // 4. Observer cho Lazy Loading
@@ -321,6 +510,66 @@ export default function App() {
     if (observerTarget.current) observer.observe(observerTarget.current);
     return () => observer.disconnect();
   }, [visibleCount, filteredData.length]);
+
+  // 5. Tính khoảng cách OSRM cho các quán đang hiển thị
+  useEffect(() => {
+    if (!userCoords || visibleData.length === 0) return;
+
+    const pendingItems = visibleData.filter(item => {
+      if (roadDistances[item.__merchantKey] !== undefined) return false;
+      return extractCoords(item) !== null;
+    });
+
+    if (pendingItems.length === 0) return;
+
+    const coordString = [
+      `${userCoords.lng},${userCoords.lat}`,
+      ...pendingItems.map(item => {
+        const coords = extractCoords(item);
+        return `${coords.lng},${coords.lat}`;
+      })
+    ].join(';');
+
+    const fetchOSRM = async () => {
+      try {
+        const res = await fetch(`${OSRM_API_BASE}${coordString}?sources=0`);
+        const data = await res.json();
+        
+        if (data.code === 'Ok' && data.distances && data.distances[0]) {
+          setRoadDistances(prev => {
+            const updated = { ...prev };
+            pendingItems.forEach((item, index) => {
+              const distMeters = data.distances[0][index + 1];
+              if (distMeters !== null && distMeters !== undefined) {
+                updated[item.__merchantKey] = (distMeters / 1000).toFixed(1);
+              }
+            });
+            return updated;
+          });
+        }
+      } catch (e) {
+        console.error("OSRM fetch failed:", e);
+      }
+    };
+
+    // Delay slighty to batch requests if scrolling fast
+    const timer = setTimeout(fetchOSRM, 300);
+    return () => clearTimeout(timer);
+  }, [visibleData, userCoords, roadDistances]);
+
+  const getDistanceDisplay = (item) => {
+    if (!userCoords) return null;
+    const coords = extractCoords(item);
+    if (!coords) return null;
+
+    const exactRoadKm = roadDistances[item.__merchantKey];
+    if (exactRoadKm !== undefined) {
+      return `${exactRoadKm} km`;
+    }
+
+    const haversineKm = calculateHaversine(userCoords.lat, userCoords.lng, coords.lat, coords.lng);
+    return `~${haversineKm.toFixed(1)} km`;
+  };
 
   return (
     <div className="min-h-screen bg-pattern text-slate-900 font-sans selection:bg-indigo-100 selection:text-indigo-700">
@@ -340,13 +589,33 @@ export default function App() {
               </h1>
             </div>
 
-            <button
-              onClick={() => setIsAreaModalOpen(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-full text-xs font-bold transition-all active:scale-95"
-            >
-              <MapPin className="w-3.5 h-3.5 text-indigo-500" />
-              <span>{selectedAreas.length === 0 ? 'Toàn khu vực' : `${selectedAreas.length} Khu vực`}</span>
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={requestLocation}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold transition-all active:scale-95 border ${
+                  locationStatus === 'granted' 
+                    ? 'bg-emerald-50 text-emerald-600 border-emerald-200 shadow-sm' 
+                    : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-transparent'
+                }`}
+              >
+                {locationStatus === 'prompting' ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <MapPin className={`w-3.5 h-3.5 ${locationStatus === 'granted' ? 'text-emerald-500' : 'text-indigo-500'}`} />
+                )}
+                <span className="hidden sm:inline">
+                  {locationStatus === 'granted' ? 'Đã định vị' : 'Gần tôi'}
+                </span>
+              </button>
+
+              <button
+                onClick={() => setIsAreaModalOpen(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-full text-xs font-bold transition-all active:scale-95 border border-transparent"
+              >
+                <MapPin className="w-3.5 h-3.5 text-indigo-500" />
+                <span className="hidden sm:inline">{selectedAreas.length === 0 ? 'Khu vực' : `${selectedAreas.length} Khu vực`}</span>
+              </button>
+            </div>
           </div>
 
           {/* Dòng 2: Search & Giờ mở cửa */}
@@ -358,7 +627,10 @@ export default function App() {
                 placeholder="Tìm tên quán..."
                 className="w-full pl-9 pr-3 py-2 bg-slate-100 border-none rounded-xl focus:ring-2 focus:ring-indigo-500 focus:bg-white transition-all outline-none text-slate-700 text-sm font-medium"
                 value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                onChange={(e) => {
+                  setVisibleCount(10);
+                  setSearchQuery(e.target.value);
+                }}
               />
             </div>
 
@@ -366,6 +638,7 @@ export default function App() {
             <div className="flex bg-slate-100 rounded-xl p-1 shrink-0">
               <button
                 onClick={() => {
+                  setVisibleCount(10);
                   setActiveFilter('current');
                   setShuffleSeed(prev => prev + 1);
                 }}
@@ -377,6 +650,7 @@ export default function App() {
               </button>
               <button
                 onClick={() => {
+                  setVisibleCount(10);
                   setActiveFilter('next');
                   setShuffleSeed(prev => prev + 1);
                 }}
@@ -425,7 +699,10 @@ export default function App() {
                 <X className="w-3 h-3" />
               </button>
             ))}
-            <button onClick={() => setSelectedAreas([])} className="text-[11px] font-bold text-slate-400 hover:text-red-500 px-2 py-1">Xóa tất cả</button>
+            <button onClick={() => {
+              setVisibleCount(10);
+              setSelectedAreas([]);
+            }} className="text-[11px] font-bold text-slate-400 hover:text-red-500 px-2 py-1">Xóa tất cả</button>
           </div>
         )}
 
@@ -451,12 +728,12 @@ export default function App() {
 
               return (
               <div
-                key={index}
+                key={item.__merchantKey || `${item.ten_quan}-${index}`}
                 className={`group bg-white rounded-2xl p-4 border border-slate-200/60 shadow-sm hover:shadow-lg hover:shadow-indigo-500/5 hover:-translate-y-0.5 transition-all duration-300 flex flex-col h-full ${isDimmedBySearch ? 'bg-slate-50 border-slate-300/70' : ''}`}
               >
                 <div className="flex items-center gap-2 mb-2">
                   <span className="px-2 py-1 bg-indigo-50 text-indigo-600 rounded text-[9px] font-extrabold uppercase tracking-wider border border-indigo-100">
-                    {item.phan_loai}
+                    {getDisplayCategory(item)}
                   </span>
                   {isDimmedBySearch && (
                     <span className="px-2 py-1 bg-amber-100 text-amber-800 rounded text-[9px] font-extrabold uppercase tracking-wider border border-amber-300 shadow-sm">
@@ -473,7 +750,12 @@ export default function App() {
                   <div className="flex-1 flex flex-col justify-end gap-2 mb-4">
                     <div className="flex items-center text-slate-500 text-[13px] font-medium">
                       <MapPin className="w-3.5 h-3.5 mr-2 text-indigo-400 shrink-0" />
-                      <span className="line-clamp-1">{item.khu_vuc}</span>
+                      <span className="line-clamp-1">
+                        {getDistanceDisplay(item) ? (
+                          <span className="font-bold text-indigo-600 mr-1.5">{getDistanceDisplay(item)} •</span>
+                        ) : null}
+                        {item.khu_vuc}
+                      </span>
                     </div>
                     <div className="flex items-center text-slate-400 text-[10px] font-bold uppercase tracking-wide">
                       <Calendar className="w-3.5 h-3.5 mr-2 text-slate-300 shrink-0" />
@@ -522,6 +804,37 @@ export default function App() {
         <p className="text-[10px] text-slate-400 font-medium">© 2026 {APP_NAME}. Made for Food Lovers.</p>
       </footer>
 
+      {/* Location Error Modal */}
+      {showLocationAlert && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm animate-fade-in" onClick={() => setShowLocationAlert(false)}></div>
+          <div className="relative w-full max-w-sm bg-white rounded-3xl shadow-2xl p-6 animate-slide-up text-center border border-slate-100">
+            <div className="w-14 h-14 bg-red-50 text-red-500 rounded-2xl flex items-center justify-center mx-auto mb-4 border border-red-100">
+              <MapPin className="w-7 h-7" />
+            </div>
+            <h3 className="text-lg font-extrabold text-slate-800 mb-2">Không thể lấy vị trí</h3>
+            <p className="text-sm text-slate-500 mb-6 px-2 leading-relaxed">
+              Bạn cần cấp quyền truy cập vị trí (GPS) để xem khoảng cách chính xác đến các quán.
+              Nếu bạn đã chặn trước đó, vui lòng mở lại trong cài đặt trình duyệt.
+            </p>
+            <div className="flex gap-3">
+              <button 
+                onClick={() => setShowLocationAlert(false)}
+                className="flex-1 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm font-bold transition-all active:scale-95"
+              >
+                Đóng
+              </button>
+              <button 
+                onClick={requestLocation}
+                className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-bold transition-all shadow-md shadow-indigo-200 active:scale-95"
+              >
+                Thử lại
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Area Modal */}
       {isAreaModalOpen && (
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
@@ -532,7 +845,10 @@ export default function App() {
               <h3 className="text-lg font-extrabold text-slate-900">Chọn khu vực</h3>
               <div className="flex items-center gap-2">
                 {selectedAreas.length > 0 && (
-                  <button onClick={() => setSelectedAreas([])} className="text-sm font-bold text-red-500 hover:text-red-600 px-3 py-1.5">
+                  <button onClick={() => {
+                    setVisibleCount(10);
+                    setSelectedAreas([]);
+                  }} className="text-sm font-bold text-red-500 hover:text-red-600 px-3 py-1.5">
                     Xóa chọn
                   </button>
                 )}
@@ -603,7 +919,6 @@ export default function App() {
     </div>
   );
 }
-
 
 
 
