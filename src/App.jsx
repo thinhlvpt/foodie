@@ -532,7 +532,32 @@ export default function App() {
       return matchesSearch && matchesCategory && matchesArea && (hasSearchQuery || matchesTime);
     });
 
+    const getComparableDistanceKm = (item) => {
+      if (!userCoords) return null;
+      const coords = extractCoords(item);
+      if (!coords) return null;
+
+      const roadKm = Number(roadDistances[item.__merchantKey]);
+      if (Number.isFinite(roadKm)) return roadKm;
+
+      return calculateHaversine(userCoords.lat, userCoords.lng, coords.lat, coords.lng);
+    };
+
     return [...filtered].sort((a, b) => {
+      if (userCoords) {
+        const aDistance = getComparableDistanceKm(a);
+        const bDistance = getComparableDistanceKm(b);
+        const aHasDistance = aDistance !== null;
+        const bHasDistance = bDistance !== null;
+
+        if (aHasDistance && bHasDistance && aDistance !== bDistance) {
+          return aDistance - bDistance;
+        }
+
+        if (aHasDistance && !bHasDistance) return -1;
+        if (!aHasDistance && bHasDistance) return 1;
+      }
+
       const aKey = `${shuffleSeed}|${a.__merchantKey || normalizeKey(a.ten_quan || '')}`;
       const bKey = `${shuffleSeed}|${b.__merchantKey || normalizeKey(b.ten_quan || '')}`;
 
@@ -546,7 +571,18 @@ export default function App() {
 
       return aPriorityKey - bPriorityKey;
     });
-  }, [groupedData, searchQuery, activeCategories, selectedAreas, activeFilter, timeConfig, hasSearchQuery, shuffleSeed]);
+  }, [
+    groupedData,
+    searchQuery,
+    activeCategories,
+    selectedAreas,
+    activeFilter,
+    timeConfig,
+    hasSearchQuery,
+    shuffleSeed,
+    userCoords,
+    roadDistances,
+  ]);
 
   // Lay du lieu hien thi theo lazy loading
   const visibleData = useMemo(() => filteredData.slice(0, visibleCount), [filteredData, visibleCount]);
@@ -975,4 +1011,3 @@ export default function App() {
     </div>
   );
 }
-
