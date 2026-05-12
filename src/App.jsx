@@ -56,10 +56,27 @@ function calculateHaversine(lat1, lon1, lat2, lon2) {
 }
 
 function extractCoords(item) {
-  if (!item || !item.lat || !item.lng) return null;
-  const lat = Number(item.lat);
-  const lng = Number(item.lng);
-  if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng };
+  if (!item) return null;
+
+  const parsePair = (latRaw, lngRaw) => {
+    const lat = Number(latRaw);
+    const lng = Number(lngRaw);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng };
+    return null;
+  };
+
+  const direct = parsePair(item.lat, item.lng);
+  if (direct) return direct;
+
+  const combined = item.toa_do || item.coordinates || item.gps || item.lat_lng;
+  if (combined && String(combined).includes(',')) {
+    const parts = String(combined).split(',');
+    if (parts.length >= 2) {
+      const merged = parsePair(parts[0].trim(), parts[1].trim());
+      if (merged) return merged;
+    }
+  }
+
   return null;
 }
 
@@ -558,9 +575,9 @@ export default function App() {
   }, [visibleData, userCoords, roadDistances]);
 
   const getDistanceDisplay = (item) => {
-    if (!userCoords) return null;
+    if (!userCoords) return 'Bật GPS';
     const coords = extractCoords(item);
-    if (!coords) return null;
+    if (!coords) return 'Chưa có tọa độ';
 
     const exactRoadKm = roadDistances[item.__merchantKey];
     if (exactRoadKm !== undefined) {
@@ -592,6 +609,7 @@ export default function App() {
             <div className="flex items-center gap-2">
               <button
                 onClick={requestLocation}
+                aria-label={locationStatus === 'granted' ? 'Đã định vị' : 'Bật định vị gần tôi'}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold transition-all active:scale-95 border ${
                   locationStatus === 'granted' 
                     ? 'bg-emerald-50 text-emerald-600 border-emerald-200 shadow-sm' 
@@ -610,9 +628,10 @@ export default function App() {
 
               <button
                 onClick={() => setIsAreaModalOpen(true)}
+                aria-label={selectedAreas.length === 0 ? 'Lọc khu vực' : `Đã chọn ${selectedAreas.length} khu vực`}
                 className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-full text-xs font-bold transition-all active:scale-95 border border-transparent"
               >
-                <MapPin className="w-3.5 h-3.5 text-indigo-500" />
+                <Filter className="w-3.5 h-3.5 text-indigo-500" />
                 <span className="hidden sm:inline">{selectedAreas.length === 0 ? 'Khu vực' : `${selectedAreas.length} Khu vực`}</span>
               </button>
             </div>
@@ -751,9 +770,9 @@ export default function App() {
                     <div className="flex items-center text-slate-500 text-[13px] font-medium">
                       <MapPin className="w-3.5 h-3.5 mr-2 text-indigo-400 shrink-0" />
                       <span className="line-clamp-1">
-                        {getDistanceDisplay(item) ? (
-                          <span className="font-bold text-indigo-600 mr-1.5">{getDistanceDisplay(item)} •</span>
-                        ) : null}
+                        <span className={`font-bold mr-1.5 ${userCoords ? 'text-indigo-600' : 'text-slate-400'}`}>
+                          {getDistanceDisplay(item)} •
+                        </span>
                         {item.khu_vuc}
                       </span>
                     </div>
@@ -919,6 +938,5 @@ export default function App() {
     </div>
   );
 }
-
 
 
